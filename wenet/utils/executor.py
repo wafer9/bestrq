@@ -26,8 +26,7 @@ class Executor:
     def __init__(self):
         self.step = 0
 
-    def train(self, model, optimizer, scheduler, data_loader, device, writer,
-              args, scaler):
+    def train(self, model, optimizer, scheduler, data_loader, device, bf16, writer, args):
         ''' Train one epoch
         '''
         model.train()
@@ -37,11 +36,8 @@ class Executor:
         epoch = args.get('epoch', 0)
         accum_grad = args.get('accum_grad', 1)
         is_distributed = args.get('is_distributed', True)
-        use_amp = args.get('use_amp', False)
         logging.info('using accumulate grad, new batch size is {} times'
                      ' larger than before'.format(accum_grad))
-        if use_amp:
-            assert scaler is not None
         # A context manager to be used in conjunction with an instance of
         # torch.nn.parallel.DistributedDataParallel to be able to train
         # with uneven inputs across participating processes.
@@ -50,10 +46,15 @@ class Executor:
         else:
             model_context = nullcontext
         num_seen_utts = 0
+        optimizer.zero_grad()
+        dtype = torch.float32
         with model_context():
             for batch_idx, batch in enumerate(data_loader):
                 key, feats, target, feats_lengths, target_lengths = batch
                 feats = feats.to(device)
+                if bf16:
+                    feats = feats.to(dtype=torch.bfloat16)
+                    dtype = torch.bfloat16
                 target = target.to(device)
                 feats_lengths = feats_lengths.to(device)
                 target_lengths = target_lengths.to(device)
@@ -74,36 +75,22 @@ class Executor:
                     # autocast context
                     # The more details about amp can be found in
                     # https://pytorch.org/docs/stable/notes/amp_examples.html
-                    with torch.cuda.amp.autocast(scaler is not None):
-                        loss_dict = model(feats, feats_lengths, target,
-                                          target_lengths)
-                        loss = loss_dict['loss'] / accum_grad
-                    if use_amp:
-                        scaler.scale(loss).backward()
+                    # with torch.cuda.amp.autocast(dtype=dtype):
+                    loss_dict = model(feats, feats_lengths, target,
+                                        target_lengths)
+                    loss = loss_dict['loss'] / accum_grad
+                    if bf16:
+                        optimizer.backward(loss)
                     else:
                         loss.backward()
 
                 num_seen_utts += num_utts
                 if batch_idx % accum_grad == 0:
                     if rank == 0 and writer is not None:
-                        writer.add_scalar('train_loss', loss, self.step)
-                    # Use mixed precision training
-                    if use_amp:
-                        scaler.unscale_(optimizer)
-                        grad_norm = clip_grad_norm_(model.parameters(), clip)
-                        # Must invoke scaler.update() if unscale_() is used in
-                        # the iteration to avoid the following error:
-                        #   RuntimeError: unscale_() has already been called
-                        #   on this optimizer since the last update().
-                        # We don't check grad here since that if the gradient
-                        # has inf/nan values, scaler.step will skip
-                        # optimizer.step().
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        grad_norm = clip_grad_norm_(model.parameters(), clip)
-                        if torch.isfinite(grad_norm):
-                            optimizer.step()
+                        writer.add_scalar('train_loss', loss.item(), self.step)
+                    grad_norm = clip_grad_norm_(model.parameters(), clip)
+                    if torch.isfinite(grad_norm):
+                        optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
                     self.step += 1
@@ -118,7 +105,7 @@ class Executor:
                     log_str += 'lr {:.8f} rank {}'.format(lr, rank)
                     logging.debug(log_str)
 
-    def cv(self, model, data_loader, device, args):
+    def cv(self, model, data_loader, device, bf16, args):
         ''' Cross validation on
         '''
         model.eval()
@@ -132,6 +119,8 @@ class Executor:
             for batch_idx, batch in enumerate(data_loader):
                 key, feats, target, feats_lengths, target_lengths = batch
                 feats = feats.to(device)
+                if bf16:
+                    feats = feats.to(dtype=torch.bfloat16)
                 target = target.to(device)
                 feats_lengths = feats_lengths.to(device)
                 target_lengths = target_lengths.to(device)

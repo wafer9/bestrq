@@ -168,7 +168,7 @@ class BaseEncoder(torch.nn.Module):
                                               self.use_dynamic_left_chunk,
                                               decoding_chunk_size,
                                               self.static_chunk_size,
-                                              num_decoding_left_chunks)
+                                              num_decoding_left_chunks).to(dtype=xs.dtype)
         for layer in self.encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
         if self.normalize_before:

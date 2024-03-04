@@ -68,7 +68,7 @@ class PositionalEncoding(torch.nn.Module):
             torch.Tensor: for compatibility to RelPositionalEncoding
         """
 
-        self.pe = self.pe.to(x.device)
+        self.pe = self.pe.to(device=x.device, dtype=x.dtype)
         pos_emb = self.position_encoding(offset, x.size(1), False)
         x = x * self.xscale + pos_emb
         return self.dropout(x), self.dropout(pos_emb)
@@ -134,7 +134,7 @@ class RelPositionalEncoding(PositionalEncoding):
             torch.Tensor: Encoded tensor (batch, time, `*`).
             torch.Tensor: Positional embedding tensor (1, time, `*`).
         """
-        self.pe = self.pe.to(x.device)
+        self.pe = self.pe.to(device=x.device, dtype=x.dtype)
         x = x * self.xscale
         pos_emb = self.position_encoding(offset, x.size(1), False)
         return self.dropout(x), self.dropout(pos_emb)
@@ -154,7 +154,7 @@ class NoPositionalEncoding(torch.nn.Module):
             -> Tuple[torch.Tensor, torch.Tensor]:
         """ Just return zero vector for interface compatibility
         """
-        pos_emb = torch.zeros(1, x.size(1), self.d_model).to(x.device)
+        pos_emb = torch.zeros(1, x.size(1), self.d_model).to(device=x.device, dtype=x.dtype)
         return self.dropout(x), pos_emb
 
     def position_encoding(

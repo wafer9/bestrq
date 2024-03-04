@@ -35,6 +35,8 @@ from wenet.utils.scheduler import WarmupLR, NoamHoldAnnealing
 from wenet.utils.config import override_config
 from wenet.utils.init_model import init_model
 
+from wenet.optim.fp16_optimizer import FP16Optimizer
+
 def get_args():
     parser = argparse.ArgumentParser(description='training your network')
     parser.add_argument('--config', required=True, help='config file')
@@ -44,35 +46,16 @@ def get_args():
                         help='train and cv data type')
     parser.add_argument('--train_data', required=True, help='train data file')
     parser.add_argument('--cv_data', required=True, help='cv data file')
-    parser.add_argument('--gpu',
-                        type=int,
-                        default=-1,
-                        help='gpu id for this local rank, -1 for cpu')
     parser.add_argument('--model_dir', required=True, help='save model dir')
     parser.add_argument('--checkpoint', help='checkpoint model')
     parser.add_argument('--tensorboard_dir',
                         default='tensorboard',
                         help='tensorboard log dir')
-    parser.add_argument('--ddp.rank',
-                        dest='rank',
-                        default=0,
-                        type=int,
-                        help='global rank for distributed training')
-    parser.add_argument('--ddp.world_size',
-                        dest='world_size',
-                        default=-1,
-                        type=int,
-                        help='''number of total processes/gpus for
-                        distributed training''')
     parser.add_argument('--ddp.dist_backend',
                         dest='dist_backend',
                         default='nccl',
                         choices=['nccl', 'gloo'],
                         help='distributed backend')
-    parser.add_argument('--ddp.init_method',
-                        dest='init_method',
-                        default=None,
-                        help='ddp init method')
     parser.add_argument('--num_workers',
                         default=0,
                         type=int,
@@ -81,10 +64,6 @@ def get_args():
                         action='store_true',
                         default=False,
                         help='Use pinned memory buffers used for reading')
-    parser.add_argument('--use_amp',
-                        action='store_true',
-                        default=False,
-                        help='Use automatic mixed precision training')
     parser.add_argument('--bf16',
                         action='store_true',
                         default=False,
@@ -96,7 +75,7 @@ def get_args():
     parser.add_argument("--non_lang_syms",
                         help="non-linguistic symbol file. One symbol per line.")
     parser.add_argument('--prefetch',
-                        default=100,
+                        default=10,
                         type=int,
                         help='prefetch number')
     parser.add_argument('--bpe_model',
@@ -126,7 +105,6 @@ def main():
     args = get_args()
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
     # Set random seed
     torch.manual_seed(777)
@@ -135,13 +113,18 @@ def main():
     if len(args.override_config) > 0:
         configs = override_config(configs, args.override_config)
 
-    distributed = args.world_size > 1
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    rank = int(os.environ.get('RANK', 0))
+    distributed = world_size > 1
+    logging.info('training on multiple gpus, local_rank {}, rank {}'.format(local_rank, rank))
     if distributed:
-        logging.info('training on multiple gpus, this gpu {}'.format(args.gpu))
+        # torch.cuda.set_device(local_rank)
+        # dist.init_process_group(args.dist_backend)
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
         dist.init_process_group(args.dist_backend,
-                                init_method=args.init_method,
-                                world_size=args.world_size,
-                                rank=args.rank)
+                                world_size=world_size,
+                                rank=rank)
 
     symbol_table = read_symbol_table(args.symbol_table)
 
@@ -185,7 +168,7 @@ def main():
     configs['output_dim'] = vocab_size
     configs['cmvn_file'] = args.cmvn
     configs['is_json_cmvn'] = True
-    if args.rank == 0:
+    if rank == 0:
         saved_config_path = os.path.join(args.model_dir, 'train.yaml')
         with open(saved_config_path, 'w') as fout:
             data = yaml.dump(configs)
@@ -193,16 +176,11 @@ def main():
 
     # Init asr model from configs
     model = init_model(configs)
-    print(model)
+    if rank == 0:
+        print(model)
     num_params = sum(p.numel() for p in model.parameters())
     print('the number of model params: {:,d}'.format(num_params))
-
-    # !!!IMPORTANT!!!
-    # Try to export the model by script, if fails, we should refine
-    # the code to satisfy the script export requirements
-    if args.rank == 0:
-        script_model = torch.jit.script(model)
-        script_model.save(os.path.join(args.model_dir, 'init.zip'))
+    
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:
@@ -219,7 +197,7 @@ def main():
     num_epochs = configs.get('max_epoch', 100)
     model_dir = args.model_dir
     writer = None
-    if args.rank == 0:
+    if rank == 0:
         os.makedirs(model_dir, exist_ok=True)
         exp_id = os.path.basename(model_dir)
         writer = SummaryWriter(os.path.join(args.tensorboard_dir, exp_id))
@@ -234,54 +212,53 @@ def main():
         if args.bf16:
             model = model.to(dtype=torch.bfloat16)
     else:
-        use_cuda = args.gpu >= 0 and torch.cuda.is_available()
+        use_cuda = torch.cuda.is_available()
         device = torch.device('cuda' if use_cuda else 'cpu')
         model = model.to(device)
         if args.bf16:
             model = model.to(dtype=torch.bfloat16)
-
-    if configs['optim'] == 'adam':
-        optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
-    elif configs['optim'] == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), **configs['optim_conf'])
+    if args.bf16:
+        params = list(filter(lambda p: p.requires_grad,model.parameters()))
+        optimizer = FP16Optimizer.build_optimizer(params, **configs['optim_conf'])
+        scheduler = WarmupLR(optimizer.optimizer, **configs['scheduler_conf'])
     else:
-        raise ValueError("unknown optimizer: " + configs['optim'])
-    if configs['scheduler'] == 'warmuplr':
-        scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
-    elif configs['scheduler'] == 'NoamHoldAnnealing':
-        scheduler = NoamHoldAnnealing(optimizer, **configs['scheduler_conf'])
-    else:
-        raise ValueError("unknown scheduler: " + configs['scheduler'])
+        if configs['optim'] == 'adam':
+            optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
+        elif configs['optim'] == 'adamw':
+            optimizer = optim.AdamW(model.parameters(), **configs['optim_conf'])
+        else:
+            raise ValueError("unknown optimizer: " + configs['optim'])
+        if configs['scheduler'] == 'warmuplr':
+            scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
+        elif configs['scheduler'] == 'NoamHoldAnnealing':
+            scheduler = NoamHoldAnnealing(optimizer, **configs['scheduler_conf'])
+        else:
+            raise ValueError("unknown scheduler: " + configs['scheduler'])
 
     final_epoch = None
-    configs['rank'] = args.rank
+    configs['rank'] = rank
     configs['is_distributed'] = distributed
-    configs['use_amp'] = args.use_amp
-    if start_epoch == 0 and args.rank == 0:
+    if start_epoch == 0 and rank == 0:
         save_model_path = os.path.join(model_dir, 'init.pt')
         save_checkpoint(model, save_model_path)
 
     # Start training loop
     executor.step = step
     scheduler.set_step(step)
-    # used for pytorch amp mixed precision training
-    scaler = None
-    if args.use_amp:
-        scaler = torch.cuda.amp.GradScaler()
 
     for epoch in range(start_epoch, num_epochs):
         train_dataset.set_epoch(epoch)
         configs['epoch'] = epoch
         lr = optimizer.param_groups[0]['lr']
         logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
-        executor.train(model, optimizer, scheduler, train_data_loader, device,
-                       writer, configs, scaler)
-        total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
+        executor.train(model, optimizer, scheduler, train_data_loader, device, args.bf16,
+                       writer, configs)
+        total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device, args.bf16,
                                                 configs)
         cv_loss = total_loss / num_seen_utts
 
         logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
-        if args.rank == 0:
+        if rank == 0:
             save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
             save_checkpoint(
                 model, save_model_path, {
@@ -294,7 +271,7 @@ def main():
             writer.add_scalar('epoch/lr', lr, epoch)
         final_epoch = epoch
 
-    if final_epoch is not None and args.rank == 0:
+    if final_epoch is not None and rank == 0:
         final_model_path = os.path.join(model_dir, 'final.pt')
         os.remove(final_model_path) if os.path.exists(final_model_path) else None
         os.symlink('{}.pt'.format(final_epoch), final_model_path)

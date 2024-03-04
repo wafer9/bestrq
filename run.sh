@@ -6,7 +6,26 @@
 
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="4,5,6,7"
+export CUDA_VISIBLE_DEVICES="0,1,2,3"
+
+# export NCCL_DEBUG=INFO
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_GID_INDEX=3
+export NCCL_IB_DISABLE=1
+export NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7
+export NCCL_NET_GDR_LEVEL=2
+export NCCL_IB_QPS_PER_CONNECTION=4
+export NCCL_IB_TC=160
+export NCCL_IB_TIMEOUT=22
+export NCCL_PXN_DISABLE=0
+
+rank=$1
+if [[ -z ${rank} ]]; then
+    echo "rank can not be empty"
+    exit 1
+fi
+echo "rank: ${rank}"
+
 stage=4 # start from 0 if you need to start from data preparation
 stop_stage=4
 # data
@@ -22,7 +41,7 @@ checkpoint=
 cmvn=true
 do_delta=false
 
-dir=exp/sp_spec_aug
+dir=exp/sp_spec_bf16
 
 # use average_checkpoint will get better result
 average_checkpoint=true
@@ -122,22 +141,21 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # Training
   mkdir -p $dir
-  INIT_FILE=$dir/ddp_init
-  rm -f $INIT_FILE # delete old one before starting
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
+  dist_backend="nccl"
   cmvn_opts=
   $cmvn && cmvn_opts="--cmvn $wave_data/${train_set}/global_cmvn"
   # train.py will write $train_config to $dir/train.yaml with model input
   # and output dimension, train.yaml will be used for inference or model
   # export later
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    python wenet/bin/train.py --gpu $gpu_id \
+    torchrun \
+      --nnodes=1 \
+      --nproc_per_node=4 \
+      --node_rank=${rank} \
+      --master_addr="10.126.203.135" \
+      --master_port=8010 \
+    wenet/bin/train.py \
       --config $train_config \
       --data_type raw \
       --symbol_table $dict \
@@ -146,16 +164,12 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       --cv_data $wave_data/$dev_set/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $num_gpus \
-      --ddp.rank $i \
       --ddp.dist_backend $dist_backend \
-      --num_workers 1 \
+      --num_workers 8 \
       $cmvn_opts \
-      --pin_memory
-  } &
-  done
-  wait
+      --pin_memory 
+      # --bf16
+
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then

@@ -20,6 +20,7 @@ from typing import Union
 import math
 import warnings
 import torch
+from wenet.optim.fp16_optimizer import FP16Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 
 from typeguard import check_argument_types
@@ -44,7 +45,7 @@ class WarmupLR(_LRScheduler):
 
     def __init__(
             self,
-            optimizer: torch.optim.Optimizer,
+            optimizer: Union[torch.optim.Optimizer, FP16Optimizer],
             warmup_steps: Union[int, float] = 25000,
             last_epoch: int = -1,
     ):
